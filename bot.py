@@ -2190,6 +2190,30 @@ async def handle_room(rid, text, uid, media_url=None, message_type=None):
         if blocked:
             return blocked
 
+    # ---------------- الذكاء الاصطناعي داخل الغرفة ----------------
+    # يدعم ai@السؤال وذكاء@السؤال، وكذلك التحيات المباشرة البسيطة.
+    # هذا الاستدعاء محلي بالكامل عبر Qwen/llama.cpp ولا يستخدم OpenAI.
+    ai_text = text.strip()
+    ai_low = normalize_text(ai_text)
+    ai_prompt = None
+    for prefix in ("ai@", "ذكاء@", "الذكاء@"):
+        if ai_low.startswith(prefix):
+            ai_prompt = ai_text[len(prefix):].strip()
+            break
+    if ai_prompt is None and any(x in ai_low for x in ("مرحبا من انت", "مرحبا من أنت", "اهلا من انت", "أهلا من أنت")):
+        ai_prompt = ai_text
+    if ai_prompt is not None:
+        if not ai_prompt:
+            return "🤖 اكتب سؤالك هكذا: ai@مرحبا، من أنت؟"
+        answer, ai_err = await ai_response(ai_prompt, 700)
+        if ai_err:
+            log.error("room local AI error: %s", ai_err)
+            return "❌ تعذر تشغيل الذكاء الاصطناعي المحلي حالياً."
+        return "🤖 " + answer
+
+    if ai_low in ("ai status", "حالة ai", "حالة الذكاء"):
+        return local_ai_status_text()
+
     replies = load_replies()
     if text.strip() in replies: return replies[text.strip()]
 
@@ -3035,11 +3059,34 @@ async def add_ai_game(uid, description):
         data = json.loads(match.group(0) if match else raw)
         command = re.sub(r"[^\w\u0600-\u06ff-]", "", str(data.get("command") or name.replace(" ", "")))[:24]
         if not command: return "❌ لم يتم توليد أمر صالح للعبة."
+        def _ai_int(value, default, minimum=None, maximum=None):
+            # النماذج المحلية قد تعيد "1-100" أو "50%" أو "20 نقطة".
+            # نستخرج رقماً صالحاً بدلاً من تمرير النص مباشرة إلى int().
+            if isinstance(value, bool):
+                num = int(value)
+            elif isinstance(value, (int, float)):
+                num = int(value)
+            else:
+                s = str(value or "").strip().replace("٪", "%")
+                m = re.search(r"-?\\d+(?:[.,]\\d+)?", s)
+                if not m:
+                    num = default
+                else:
+                    try:
+                        num = int(float(m.group(0).replace(",", ".")))
+                    except (TypeError, ValueError):
+                        num = default
+            if minimum is not None:
+                num = max(minimum, num)
+            if maximum is not None:
+                num = min(maximum, num)
+            return num
+
         data = {
             "command": command, "title": str(data.get("title") or name)[:80],
-            "win_chance": max(1, min(100, int(data.get("win_chance", 50)))),
-            "win_points": max(-1000, min(1000, int(data.get("win_points", 20)))),
-            "lose_points": max(-1000, min(1000, int(data.get("lose_points", -5)))),
+            "win_chance": _ai_int(data.get("win_chance", 50), 50, 1, 100),
+            "win_points": _ai_int(data.get("win_points", 20), 20, -1000, 1000),
+            "lose_points": _ai_int(data.get("lose_points", -5), -5, -1000, 1000),
             "win_message": str(data.get("win_message") or "🎉 فوز!")[:200],
             "lose_message": str(data.get("lose_message") or "😅 خسارة!")[:200],
             "image_prompt": str(data.get("image_prompt") or f"Game card for {name}, no text")[:1000],
@@ -3053,7 +3100,18 @@ async def add_ai_game(uid, description):
         except Exception: pass
         return f"✅ تمت إضافة اللعبة @{command}\n🎮 {data['title']}\n🖼️ تم تصميم صورتها وإضافتها تلقائياً.\nاكتب: {command}"
     except Exception as exc:
-        return f"❌ تعذر اعتماد تعريف اللعبة من الذكاء الاصطناعي: {type(exc).__name__}: {exc}"
+        # تفاصيل الخطأ لا تظهر في الغرفة. تُرسل فقط إلى المالك في الخاص.
+        private_error = (
+            "⚠️ خطأ في اعتماد لعبة بالذكاء الاصطناعي\\n"
+            f"النوع: {type(exc).__name__}\\n"
+            f"التفاصيل: {exc}\\n"
+            f"اسم اللعبة: {name}"
+        )
+        try:
+            await dm_send(uid, private_error)
+        except Exception:
+            log.exception("تعذر إرسال خطأ إنشاء اللعبة إلى المالك في الخاص")
+        return "❌ تعذر اعتماد تعريف اللعبة من الذكاء الاصطناعي. تم إرسال تفاصيل الخطأ إلى المالك في الخاص."
 
 async def handle_ai_dm(sender, text):
     if (await username_of(sender)).lower() != OWNER:
